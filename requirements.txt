@@ -3,3 +3,4 @@ uvicorn
 gunicorn
 pillow
 python-multipart
+redis
