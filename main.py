@@ -4,13 +4,27 @@ from PIL import Image
 import io
 import base64
 import logging
+import os
+import redis
+import hashlib
 
-# Cấu hình logging để xem lỗi trên Render
+# Cấu hình logging
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="POS GNP AI Server")
 
-# Cho phép ứng dụng web (POS GNP) gọi vào API này (CORS)
+# Cấu hình Redis (Lấy URL từ Environment Variable trên Render)
+# Ví dụ REDIS_URL: redis://default:password@host:port
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+try:
+    r = redis.from_url(REDIS_URL, ssl_cert_reqs=None)
+    r.ping()
+    logging.info("✅ Kết nối Redis thành công")
+except Exception as e:
+    logging.warning(f"⚠️ Không kết nối được Redis ({e}). Hệ thống sẽ chạy không có cache.")
+    r = None
+
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -21,75 +35,88 @@ app.add_middleware(
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "message": "POS AI Server is running. Ready to compress images!"}
+    return {"status": "ok", "message": "POS AI Server is running with Redis support!"}
 
-# 1. ENDPOINT NÉN ẢNH (Khớp với goiPythonAPI trong Code.gs)
+# 1. ENDPOINT NÉN ẢNH (Có Cache Redis)
 @app.post("/nen-anh")
 async def compress_image(file: UploadFile = File(...)):
     try:
         contents = await file.read()
-        image = Image.open(io.BytesIO(contents))
         
-        # Chuyển sang RGB nếu ảnh là PNG có nền trong suốt (tránh lỗi khi lưu JPEG)
+        # Tạo hash của ảnh để làm key cache
+        file_hash = hashlib.md5(contents).hexdigest()
+        cache_key = f"img_compress_{file_hash}"
+        
+        # Kiểm tra Redis Cache
+        if r:
+            cached_result = r.get(cache_key)
+            if cached_result:
+                logging.info(f"⚡ Cache Hit: {cache_key}")
+                return {"b64": cached_result.decode('utf-8')}
+
+        # Xử lý ảnh nếu không có cache
+        image = Image.open(io.BytesIO(contents))
         if image.mode in ("RGBA", "P"):
             image = image.convert('RGB')
-
-        # Resize ảnh về tối đa 800px (tối ưu cho Google Apps Script)
         image.thumbnail((800, 800), Image.LANCZOS)
         
-        # Lưu lại vào bộ nhớ đệm dưới dạng JPEG
         buffered = io.BytesIO()
         image.save(buffered, format="JPEG", quality=75)
-        
-        # QUAN TRỌNG: Trả về chuỗi base64 THUẦN TÚY (không có tiền tố data:image...)
-        # Vì Google Apps Script Utilities.base64Decode chỉ nhận chuỗi thuần
         img_str = base64.b64encode(buffered.getvalue()).decode()
+        
+        # Lưu vào Redis (TTL 1 tiếng)
+        if r:
+            r.setex(cache_key, 3600, img_str)
+            logging.info(f"💾 Cached: {cache_key}")
         
         return {"b64": img_str}
     except Exception as e:
         logging.error(f"Lỗi nén ảnh: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# 2. ENDPOINT ĐỌC BẢNG GIÁ / TÌM KIẾM ẢNH (Khớp với processAIQueue trong JS)
-# Trong JS bạn gọi là '/ai-doc-bang-gia', nên mình đặt tên route y hệt
+# 2. ENDPOINT ĐỌC BẢNG GIÁ (Mock + Cache)
 @app.post("/ai-doc-bang-gia")
 async def ai_read_price_list(file: UploadFile = File(...)):
-    """
-    Hàm này hiện tại là GIẢ LẬP (Mock).
-    Để dùng thật, bạn cần tích hợp Google Vision API hoặc Gemini API ở đây.
-    """
     try:
-        # Giả lập dữ liệu trả về để test kết nối
-        # Cấu trúc trả về phải khớp với những gì JS mong đợi: { success: true, danhSach: [...] }
-        return {
+        contents = await file.read()
+        file_hash = hashlib.md5(contents).hexdigest()
+        cache_key = f"ai_price_{file_hash}"
+        
+        if r:
+            cached_result = r.get(cache_key)
+            if cached_result:
+                import json
+                return json.loads(cached_result)
+
+        # Giả lập dữ liệu (Thực tế sẽ gọi Gemini/Vision ở đây)
+        result = {
             "success": True,
             "danhSach": [
-                {"ten": "Sữa tươi Vinamilk (Test)", "ma": "SP001", "giaNhap": 25000},
-                {"ten": "Bánh mì Sandwich (Test)", "ma": "SP002", "giaNhap": 12000}
+                {"ten": "Sữa tươi Vinamilk (AI)", "ma": "SP001", "giaNhap": 25000},
+                {"ten": "Bánh mì Sandwich (AI)", "ma": "SP002", "giaNhap": 12000}
             ]
         }
+        
+        if r:
+            import json
+            r.setex(cache_key, 3600, json.dumps(result))
+            
+        return result
     except Exception as e:
-        logging.error(f"Lỗi AI đọc bảng giá: {str(e)}")
+        logging.error(f"Lỗi AI: {str(e)}")
         return {"success": False, "error": str(e)}
 
-# 3. ENDPOINT DỰ BÁO TỒN KHO (Khớp với layDuBaoTonKhoPython trong Code.gs)
+# 3. ENDPOINT DỰ BÁO (Mock)
 @app.get("/bao-cao-du-bao/{days}")
 async def forecast_stock(days: int):
-    # Giả lập dữ liệu dự báo tồn kho
-    # Cấu trúc trả về khớp với Code.gs: [{ten, ngay_con, muc_do}]
     return [
         {"ten": "Sữa tươi Vinamilk", "ngay_con": 3, "muc_do": "nguy_hiem"},
-        {"ten": "Bánh mì Sandwich", "ngay_con": 5, "muc_do": "canh_bao"},
-        {"ten": "Coca Cola 330ml", "ngay_con": 10, "muc_do": "an_toan"}
+        {"ten": "Bánh mì Sandwich", "ngay_con": 5, "muc_do": "canh_bao"}
     ]
 
-# Endpoint phụ để test tìm kiếm bằng ảnh (nếu bạn muốn dùng riêng)
 @app.post("/tim-bang-anh")
 async def search_by_image(file: UploadFile = File(...)):
     return {
-        "tenAI": "Sản phẩm mẫu (Test)",
-        "danhSach": [
-            {"id": "1", "ten": "Sữa tươi Vinamilk", "gia": 28000},
-            {"id": "2", "ten": "Bánh mì Sandwich", "gia": 15000}
-        ]
+        "tenAI": "Sản phẩm mẫu",
+        "danhSach": [{"id": "1", "ten": "Sữa tươi", "gia": 28000}]
     }
