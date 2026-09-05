@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Optional, List
 from contextlib import contextmanager
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import redis
@@ -33,13 +33,14 @@ app.add_middleware(
 
 # --- CẤU HÌNH MÔI TRƯỜNG (ENVIRONMENT VARIABLES) ---
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-SQLITE_DB_PATH = "ai_history.db"
+SQLITE_DB_PATH = "pos_data.db" # Dùng chung 1 file DB cho gọn
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "") 
+GAS_WEB_APP_URL = os.getenv("GAS_WEB_APP_URL", "") # URL Web App GAS để sync ngược
 
 # --- KẾT NỐI REDIS (CACHE) ---
 r = None
 try:
-    # ssl_cert_reqs=None cần thiết cho một số nhà cung cấp Redis cloud (như Upstash)
+    # ssl_cert_reqs=None cần thiết cho Upstash Redis
     r = redis.from_url(REDIS_URL, ssl_cert_reqs=None, decode_responses=True)
     r.ping()
     logging.info("✅ Kết nối Redis thành công")
@@ -47,11 +48,12 @@ except Exception as e:
     logging.warning(f"⚠️ Không kết nối được Redis: {e}. Hệ thống sẽ chạy không có cache.")
     r = None
 
-# --- KẾT NỐI SQLITE (LOG LỊCH SỬ) ---
+# --- KẾT NỐI SQLITE (LOG & INVOICES) ---
 def init_sqlite():
     try:
         conn = sqlite3.connect(SQLITE_DB_PATH)
         cursor = conn.cursor()
+        # Bảng log AI
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS ai_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,6 +62,15 @@ def init_sqlite():
                 input_summary TEXT,
                 output_result TEXT,
                 processing_time_ms INTEGER,
+                status TEXT
+            )
+        ''')
+        # Bảng hóa đơn tạm (cho thanh toán nhanh)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS invoices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ma_hd TEXT,
+                data JSON,
                 status TEXT
             )
         ''')
@@ -91,26 +102,47 @@ def log_ai_action(action: str, input_summary: str, output_result: str, time_ms: 
     except Exception as e:
         logging.error(f"Lỗi ghi log SQLite: {e}")
 
-# --- TIỆN ÍCH XỬ LÝ ẢNH ---
-def compress_image_base64(base64_str: str, quality: int = 75, max_size: int = 800) -> str:
+# --- MODELS CHO THANH TOÁN ---
+class InvoiceItem(BaseModel):
+    ten: str
+    ma: str
+    gia: float
+    soLuong: int
+    maKho: str
+
+class InvoiceRequest(BaseModel):
+    maHD: str
+    tenKhach: str
+    danhSach: List[InvoiceItem]
+    tongTien: float
+    nhanVien: str
+
+# --- BACKGROUND JOB: SYNC VỀ GOOGLE SHEETS ---
+def sync_to_google_sheets(ma_hd: str):
+    if not GAS_WEB_APP_URL:
+        logging.warning("Chưa cấu hình GAS_WEB_APP_URL, bỏ qua sync.")
+        return
+        
     try:
-        if "," in base64_str:
-            base64_str = base64_str.split(",")[1]
-        
-        img_data = base64.b64decode(base64_str)
-        img = Image.open(io.BytesIO(img_data))
-        
-        img.thumbnail((max_size, max_size))
-        
-        if img.mode in ("RGBA", "P"):
-            img = img.convert("RGB")
-            
-        buffered = io.BytesIO()
-        img.save(buffered, format="JPEG", quality=quality)
-        return base64.b64encode(buffered.getvalue()).decode()
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT data FROM invoices WHERE ma_hd=?", (ma_hd,))
+            row = cursor.fetchone()
+            if row:
+                payload = json.loads(row[0])
+                # Gọi sang GAS (doPost)
+                response = requests.post(GAS_WEB_APP_URL, json={
+                    "action": "sync_invoice",
+                    "data": payload
+                })
+                if response.status_code == 200:
+                    cursor.execute("UPDATE invoices SET status='SYNCED' WHERE ma_hd=?", (ma_hd,))
+                    conn.commit()
+                    logging.info(f"✅ Đã sync hóa đơn {ma_hd} về Google Sheets")
+                else:
+                    logging.error(f"Lỗi sync GAS: {response.status_code}")
     except Exception as e:
-        logging.error(f"Lỗi nén ảnh base64: {e}")
-        return base64_str
+        logging.error(f"Lỗi sync_to_google_sheets: {e}")
 
 # --- ENDPOINTS ---
 
@@ -118,7 +150,40 @@ def compress_image_base64(base64_str: str, quality: int = 75, max_size: int = 80
 def read_root():
     return {"status": "ok", "message": "POS AI Bridge is running with SQLite & Redis"}
 
-# 1. NÉN ẢNH (Dùng cho upload ảnh sản phẩm)
+# 1. THANH TOÁN NHANH (Lưu SQLite + Trừ Redis + Sync Background)
+@app.post("/api/thanh-toan-nhanh")
+async def thanh_toan_nhanh(invoice: InvoiceRequest, background_tasks: BackgroundTasks):
+    start_time = datetime.now()
+    try:
+        # 1. Lưu vào SQLite
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("INSERT INTO invoices (ma_hd, data, status) VALUES (?, ?, ?)", 
+                           (invoice.maHD, invoice.json(), "PENDING"))
+            conn.commit()
+
+        # 2. Trừ tồn kho trong Redis (Nếu có Redis)
+        if r:
+            pipe = r.pipeline()
+            for item in invoice.danhSach:
+                # Key tồn kho: tonkho:{ma_sp}
+                pipe.decrby(f"tonkho:{item.ma}", item.soLuong)
+            pipe.execute()
+            logging.info(f"📉 Đã trừ tồn kho Redis cho {invoice.maHD}")
+
+        # 3. Đẩy vào Background Task để sync về Google Sheets sau
+        background_tasks.add_task(sync_to_google_sheets, invoice.maHD)
+        
+        end_time = datetime.now()
+        duration = int((end_time - start_time).total_seconds() * 1000)
+        log_ai_action("PAYMENT", f"HD: {invoice.maHD}", f"Tong: {invoice.tongTien}", duration, "SUCCESS")
+
+        return {"status": "success", "message": "Đã xử lý tức thì", "maHD": invoice.maHD}
+    except Exception as e:
+        log_ai_action("PAYMENT", f"HD: {invoice.maHD}", str(e), 0, "FAILED")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# 2. NÉN ẢNH (Dùng cho upload ảnh sản phẩm)
 @app.post("/api/nen-anh")
 async def compress_image_endpoint(file: UploadFile = File(...)):
     start_time = datetime.now()
@@ -143,7 +208,7 @@ async def compress_image_endpoint(file: UploadFile = File(...)):
         log_ai_action("COMPRESS_IMAGE", f"File: {file.filename}", str(e), 0, "FAILED")
         raise HTTPException(status_code=500, detail=str(e))
 
-# 2. TÌM KIẾM BẰNG HÌNH ẢNH (AI Vision)
+# 3. TÌM KIẾM BẰNG HÌNH ẢNH (AI Vision + Cache)
 @app.post("/api/tim-bang-anh")
 async def search_by_image_endpoint(file: UploadFile = File(...)):
     start_time = datetime.now()
@@ -167,7 +232,6 @@ async def search_by_image_endpoint(file: UploadFile = File(...)):
         
         if GEMINI_API_KEY:
             img_b64 = base64.b64encode(contents).decode()
-            # Sử dụng gemini-1.5-flash cho tốc độ nhanh và chi phí thấp
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
             prompt = "Nhận diện sản phẩm trong ảnh này. Trả về JSON: {'ten': 'tên sản phẩm', 'tuKhoa': ['kw1', 'kw2']}"
             
@@ -209,7 +273,7 @@ async def search_by_image_endpoint(file: UploadFile = File(...)):
         log_ai_action("SEARCH_IMAGE", "Unknown", str(e), 0, "FAILED")
         raise HTTPException(status_code=500, detail=str(e))
 
-# 3. DỰ BÁO TỒN KHO (Mock Data)
+# 4. DỰ BÁO TỒN KHO (Mock Data)
 @app.get("/api/bao-cao-du-bao/{days}")
 async def forecast_stock_endpoint(days: int):
     mock_data = [
@@ -219,90 +283,17 @@ async def forecast_stock_endpoint(days: int):
     log_ai_action("FORECAST", f"Days: {days}", json.dumps(mock_data), 10, "SUCCESS_MOCK")
     return mock_data
 
-# 4. XEM LOG (Debug)
+# 5. XEM LOG (Debug)
 @app.get("/api/logs")
 def get_logs(limit: int = 10):
     try:
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM ai_logs ORDER BY id DESC LIMIT ?", (limit,))
-
-            from fastapi import FastAPI, BackgroundTasks
-from pydantic import BaseModel
-import redis
-import sqlite3
-import requests
-import json
-from typing import List
-
-app = FastAPI()
-
-# Cấu hình Redis và Google Apps Script Web App URL (để sync ngược lại)
-REDIS_URL = "YOUR_REDIS_URL_HERE" # Ví dụ: redis://default:password@host:port
-GAS_WEB_APP_URL = "YOUR_GAS_WEB_APP_URL_HERE" # URL dùng để sync data ngược lại Sheet
-
-r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-
-# Khởi tạo SQLite
-conn = sqlite3.connect('pos_data.db', check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute('''CREATE TABLE IF NOT EXISTS invoices 
-                  (id INTEGER PRIMARY KEY AUTOINCREMENT, ma_hd TEXT, data JSON, status TEXT)''')
-conn.commit()
-
-class InvoiceItem(BaseModel):
-    ten: str
-    ma: str
-    gia: float
-    soLuong: int
-    maKho: str
-
-class InvoiceRequest(BaseModel):
-    maHD: str
-    tenKhach: str
-    danhSach: List[InvoiceItem]
-    tongTien: float
-    nhanVien: str
-
-# Hàm Background Job: Đồng bộ dữ liệu từ SQLite/Redis về Google Sheets
-def sync_to_google_sheets(ma_hd: str):
-    try:
-        # Lấy dữ liệu từ SQLite
-        cursor.execute("SELECT data FROM invoices WHERE ma_hd=?", (ma_hd,))
-        row = cursor.fetchone()
-        if row:
-            payload = json.loads(row[0])
-            # Gọi sang GAS để ghi vào Sheet thật (Hàm này bạn cần tạo bên GAS: `syncDataFromPython`)
-            requests.post(GAS_WEB_APP_URL, json={
-                "action": "sync_invoice",
-                "data": payload
-            })
-            # Đánh dấu đã sync
-            cursor.execute("UPDATE invoices SET status='SYNCED' WHERE ma_hd=?", (ma_hd,))
-            conn.commit()
-    except Exception as e:
-        print(f"Lỗi sync: {e}")
-
-@app.post("/api/thanh-toan-nhanh")
-async def thanh_toan_nhanh(invoice: InvoiceRequest, background_tasks: BackgroundTasks):
-    # 1. Lưu vào SQLite (Nhanh hơn Sheet 100 lần)
-    cursor.execute("INSERT INTO invoices (ma_hd, data, status) VALUES (?, ?, ?)", 
-                   (invoice.maHD, invoice.json(), "PENDING"))
-    conn.commit()
-
-    # 2. Trừ tồn kho trong Redis (Tức thì)
-    pipe = r.pipeline()
-    for item in invoice.danhSach:
-        # Key tồn kho: tonkho:{ma_sp}
-        # Dùng DECRBY để trừ số lượng nguyên tử (atomic)
-        pipe.decrby(f"tonkho:{item.ma}", item.soLuong)
-    pipe.execute()
-
-    # 3. Đẩy vào Background Task để sync về Google Sheets sau
-    background_tasks.add_task(sync_to_google_sheets, invoice.maHD)
-
-    return {"status": "success", "message": "Đã xử lý tức thì", "maHD": invoice.maHD}
             rows = cursor.fetchall()
-            return {"logs": rows}
+            # Chuyển tuple thành dict để dễ đọc
+            columns = [description[0] for description in cursor.description]
+            result = [dict(zip(columns, row)) for row in rows]
+            return {"logs": result}
     except Exception as e:
         return {"error": str(e)}
