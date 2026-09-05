@@ -226,6 +226,82 @@ def get_logs(limit: int = 10):
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM ai_logs ORDER BY id DESC LIMIT ?", (limit,))
+
+            from fastapi import FastAPI, BackgroundTasks
+from pydantic import BaseModel
+import redis
+import sqlite3
+import requests
+import json
+from typing import List
+
+app = FastAPI()
+
+# Cấu hình Redis và Google Apps Script Web App URL (để sync ngược lại)
+REDIS_URL = "YOUR_REDIS_URL_HERE" # Ví dụ: redis://default:password@host:port
+GAS_WEB_APP_URL = "YOUR_GAS_WEB_APP_URL_HERE" # URL dùng để sync data ngược lại Sheet
+
+r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+
+# Khởi tạo SQLite
+conn = sqlite3.connect('pos_data.db', check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute('''CREATE TABLE IF NOT EXISTS invoices 
+                  (id INTEGER PRIMARY KEY AUTOINCREMENT, ma_hd TEXT, data JSON, status TEXT)''')
+conn.commit()
+
+class InvoiceItem(BaseModel):
+    ten: str
+    ma: str
+    gia: float
+    soLuong: int
+    maKho: str
+
+class InvoiceRequest(BaseModel):
+    maHD: str
+    tenKhach: str
+    danhSach: List[InvoiceItem]
+    tongTien: float
+    nhanVien: str
+
+# Hàm Background Job: Đồng bộ dữ liệu từ SQLite/Redis về Google Sheets
+def sync_to_google_sheets(ma_hd: str):
+    try:
+        # Lấy dữ liệu từ SQLite
+        cursor.execute("SELECT data FROM invoices WHERE ma_hd=?", (ma_hd,))
+        row = cursor.fetchone()
+        if row:
+            payload = json.loads(row[0])
+            # Gọi sang GAS để ghi vào Sheet thật (Hàm này bạn cần tạo bên GAS: `syncDataFromPython`)
+            requests.post(GAS_WEB_APP_URL, json={
+                "action": "sync_invoice",
+                "data": payload
+            })
+            # Đánh dấu đã sync
+            cursor.execute("UPDATE invoices SET status='SYNCED' WHERE ma_hd=?", (ma_hd,))
+            conn.commit()
+    except Exception as e:
+        print(f"Lỗi sync: {e}")
+
+@app.post("/api/thanh-toan-nhanh")
+async def thanh_toan_nhanh(invoice: InvoiceRequest, background_tasks: BackgroundTasks):
+    # 1. Lưu vào SQLite (Nhanh hơn Sheet 100 lần)
+    cursor.execute("INSERT INTO invoices (ma_hd, data, status) VALUES (?, ?, ?)", 
+                   (invoice.maHD, invoice.json(), "PENDING"))
+    conn.commit()
+
+    # 2. Trừ tồn kho trong Redis (Tức thì)
+    pipe = r.pipeline()
+    for item in invoice.danhSach:
+        # Key tồn kho: tonkho:{ma_sp}
+        # Dùng DECRBY để trừ số lượng nguyên tử (atomic)
+        pipe.decrby(f"tonkho:{item.ma}", item.soLuong)
+    pipe.execute()
+
+    # 3. Đẩy vào Background Task để sync về Google Sheets sau
+    background_tasks.add_task(sync_to_google_sheets, invoice.maHD)
+
+    return {"status": "success", "message": "Đã xử lý tức thì", "maHD": invoice.maHD}
             rows = cursor.fetchall()
             return {"logs": rows}
     except Exception as e:
