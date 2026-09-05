@@ -2,5 +2,6 @@ fastapi
 uvicorn
 gunicorn
 pillow
-python-multipart
 redis
+requests
+python-multipart
