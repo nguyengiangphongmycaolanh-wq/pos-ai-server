@@ -1,7 +1,6 @@
 fastapi
 uvicorn
-gunicorn
+python-multipart
 pillow
 redis
 requests
-python-multipart
