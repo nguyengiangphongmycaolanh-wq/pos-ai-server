@@ -33,14 +33,17 @@ app.add_middleware(
 
 # --- CẤU HÌNH MÔI TRƯỜNG (ENVIRONMENT VARIABLES) ---
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-SQLITE_DB_PATH = "pos_data.db" # Dùng chung 1 file DB cho gọn
+SQLITE_DB_PATH = "pos_data.db"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "") 
-GAS_WEB_APP_URL = os.getenv("GAS_WEB_APP_URL", "") # URL Web App GAS để sync ngược
+GAS_WEB_APP_URL = os.getenv("GAS_WEB_APP_URL", "")
+
+# --- CẤU HÌNH TELEGRAM BOT (THAY THẾ ZALO) ---
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # --- KẾT NỐI REDIS (CACHE) ---
 r = None
 try:
-    # ssl_cert_reqs=None cần thiết cho Upstash Redis
     r = redis.from_url(REDIS_URL, ssl_cert_reqs=None, decode_responses=True)
     r.ping()
     logging.info("✅ Kết nối Redis thành công")
@@ -53,7 +56,6 @@ def init_sqlite():
     try:
         conn = sqlite3.connect(SQLITE_DB_PATH)
         cursor = conn.cursor()
-        # Bảng log AI
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS ai_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,7 +67,6 @@ def init_sqlite():
                 status TEXT
             )
         ''')
-        # Bảng hóa đơn tạm (cho thanh toán nhanh)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS invoices (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,8 +118,53 @@ class InvoiceRequest(BaseModel):
     tongTien: float
     nhanVien: str
 
-# --- BACKGROUND JOB: SYNC VỀ GOOGLE SHEETS ---
-def sync_to_google_sheets(ma_hd: str):
+# --- HÀM GỬI TELEGRAM (TIỆN ÍCH) ---
+def send_telegram_message(message: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.warning("Chưa cấu hình Telegram Bot Token hoặc Chat ID")
+        return False
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown" # Hỗ trợ in đậm, nghiêng
+    }
+    try:
+        response = requests.post(url, json=payload, timeout=5)
+        if response.status_code == 200:
+            logging.info("✅ Đã gửi thông báo Telegram")
+            return True
+        else:
+            logging.error(f"Lỗi gửi Telegram: {response.text}")
+            return False
+    except Exception as e:
+        logging.error(f"Lỗi kết nối Telegram: {e}")
+        return False
+
+# --- BACKGROUND JOB: SYNC VỀ GOOGLE SHEETS + GỬI TELEGRAM ---
+def sync_to_google_sheets_and_notify(ma_hd: str):
+    # 1. Gửi thông báo Telegram ngay lập tức
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT data FROM invoices WHERE ma_hd=?", (ma_hd,))
+            row = cursor.fetchone()
+            if row:
+                data = json.loads(row[0])
+                # Format tin nhắn đẹp mắt
+                msg = f"🔔 *THÔNG BÁO BÁN HÀNG*\n" \
+                      f"🧾 *Mã HĐ:* `{data.get('maHD', 'N/A')}`\n" \
+                      f"👤 *Khách:* {data.get('tenKhach', 'Khách lẻ')}\n" \
+                      f"💰 *Tổng:* {data.get('tongTien', 0):,.0f}₫\n" \
+                      f"👨‍💼 *NV:* {data.get('nhanVien', 'N/A')}\n" \
+                      f"⏰ _{datetime.now().strftime('%H:%M:%S %d/%m/%Y')}_"
+                
+                send_telegram_message(msg)
+    except Exception as e:
+        logging.error(f"Lỗi gửi notify: {e}")
+
+    # 2. Sync về Google Sheets
     if not GAS_WEB_APP_URL:
         logging.warning("Chưa cấu hình GAS_WEB_APP_URL, bỏ qua sync.")
         return
@@ -130,7 +176,6 @@ def sync_to_google_sheets(ma_hd: str):
             row = cursor.fetchone()
             if row:
                 payload = json.loads(row[0])
-                # Gọi sang GAS (doPost)
                 response = requests.post(GAS_WEB_APP_URL, json={
                     "action": "sync_invoice",
                     "data": payload
@@ -148,9 +193,9 @@ def sync_to_google_sheets(ma_hd: str):
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "message": "POS AI Bridge is running with SQLite & Redis"}
+    return {"status": "ok", "message": "POS AI Bridge is running with SQLite, Redis & Telegram"}
 
-# 1. THANH TOÁN NHANH (Lưu SQLite + Trừ Redis + Sync Background)
+# 1. THANH TOÁN NHANH (Lưu SQLite + Trừ Redis + Sync Background + Telegram)
 @app.post("/api/thanh-toan-nhanh")
 async def thanh_toan_nhanh(invoice: InvoiceRequest, background_tasks: BackgroundTasks):
     start_time = datetime.now()
@@ -158,21 +203,21 @@ async def thanh_toan_nhanh(invoice: InvoiceRequest, background_tasks: Background
         # 1. Lưu vào SQLite
         with get_db() as conn:
             cursor = conn.cursor()
+            # Lưu dưới dạng JSON string
             cursor.execute("INSERT INTO invoices (ma_hd, data, status) VALUES (?, ?, ?)", 
                            (invoice.maHD, invoice.json(), "PENDING"))
             conn.commit()
 
-        # 2. Trừ tồn kho trong Redis (Nếu có Redis)
+        # 2. Trừ tồn kho trong Redis
         if r:
             pipe = r.pipeline()
             for item in invoice.danhSach:
-                # Key tồn kho: tonkho:{ma_sp}
                 pipe.decrby(f"tonkho:{item.ma}", item.soLuong)
             pipe.execute()
             logging.info(f"📉 Đã trừ tồn kho Redis cho {invoice.maHD}")
 
-        # 3. Đẩy vào Background Task để sync về Google Sheets sau
-        background_tasks.add_task(sync_to_google_sheets, invoice.maHD)
+        # 3. Đẩy vào Background Task (Sync Sheet + Gửi Telegram)
+        background_tasks.add_task(sync_to_google_sheets_and_notify, invoice.maHD)
         
         end_time = datetime.now()
         duration = int((end_time - start_time).total_seconds() * 1000)
@@ -182,6 +227,14 @@ async def thanh_toan_nhanh(invoice: InvoiceRequest, background_tasks: Background
     except Exception as e:
         log_ai_action("PAYMENT", f"HD: {invoice.maHD}", str(e), 0, "FAILED")
         raise HTTPException(status_code=500, detail=str(e))
+
+# Endpoint phụ để test gửi Telegram thủ công
+@app.get("/api/test-telegram")
+def test_telegram():
+    success = send_telegram_message("🤖 *Test thành công!* Bot POS GNP đã hoạt động.")
+    if success:
+        return {"status": "success", "message": "Đã gửi tin nhắn test tới Telegram"}
+    return {"status": "error", "message": "Gửi thất bại, kiểm tra log"}
 
 # 2. NÉN ẢNH (Dùng cho upload ảnh sản phẩm)
 @app.post("/api/nen-anh")
@@ -214,12 +267,9 @@ async def search_by_image_endpoint(file: UploadFile = File(...)):
     start_time = datetime.now()
     try:
         contents = await file.read()
-        
-        # Tạo Hash để Cache
         img_hash = hashlib.md5(contents).hexdigest()
         cache_key = f"img_search_{img_hash}"
         
-        # Kiểm tra Redis Cache
         if r:
             cached_result = r.get(cache_key)
             if cached_result:
@@ -227,7 +277,6 @@ async def search_by_image_endpoint(file: UploadFile = File(...)):
                 log_ai_action("SEARCH_IMAGE", f"Hash: {img_hash}", "Cache Hit", 0, "SUCCESS")
                 return json.loads(cached_result)
 
-        # Gọi Gemini API nếu chưa có cache
         result_data = {"tenAI": "Sản phẩm chưa xác định", "danhSach": []}
         
         if GEMINI_API_KEY:
@@ -259,7 +308,6 @@ async def search_by_image_endpoint(file: UploadFile = File(...)):
                 except:
                     pass
         
-        # Lưu Cache
         if r:
             r.setex(cache_key, 3600, json.dumps(result_data))
             
@@ -291,7 +339,6 @@ def get_logs(limit: int = 10):
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM ai_logs ORDER BY id DESC LIMIT ?", (limit,))
             rows = cursor.fetchall()
-            # Chuyển tuple thành dict để dễ đọc
             columns = [description[0] for description in cursor.description]
             result = [dict(zip(columns, row)) for row in rows]
             return {"logs": result}
