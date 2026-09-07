@@ -34,11 +34,16 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 r = None
 if REDIS_URL:
     try:
-        r = redis.from_url(REDIS_URL, ssl_cert_reqs=None, decode_responses=True)
-        r.ping(); log.info("✅ Redis connected")
+        import redis
+        # Fix SSL cho redis-py >= 4.0
+        if REDIS_URL.startswith('rediss://'):
+            _r = redis.from_url(REDIS_URL, ssl_cert_reqs=None, ssl_ca_certs=None)
+        else:
+            _r = redis.from_url(REDIS_URL)
+        _r.ping()
+        log.info("✅ Redis connected")
     except Exception as e:
-        log.warning("⚠️ Redis OFF: %s", e); r = None
-
+        log.warning("⚠️ Redis OFF: %s", e); _r = None
 # ---------------- SQLITE ----------------
 @contextmanager
 def get_db():
