@@ -1,12 +1,10 @@
-import os
-import io
-import json
-import base64
-import sqlite3
-import hashlib
-import logging
-from datetime import datetime
-from typing import Optional, List
+# ============================================================
+# POS GNP — PYTHON BRIDGE (FastAPI + Redis + SQLite)
+# Bản vá tương thích 100% với GAS v14 + Frontend v13 / KIT v4
+# ============================================================
+import os, io, json, base64, sqlite3, hashlib, logging, unicodedata
+from datetime import datetime, timedelta
+from typing import Optional, List, Any
 from contextlib import contextmanager
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
@@ -16,351 +14,351 @@ import redis
 from PIL import Image
 import requests
 
-# --- CẤU HÌNH LOGGING ---
 logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("pos-bridge")
 
-# --- KHỞI TẠO FASTAPI ---
 app = FastAPI(title="POS GNP AI Bridge")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+                   allow_methods=["*"], allow_headers=["*"])
 
-# Cho phép Google Apps Script gọi sang (CORS)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- CẤU HÌNH MÔI TRƯỜNG (ENVIRONMENT VARIABLES) ---
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-SQLITE_DB_PATH = "pos_data.db"
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "") 
-GAS_WEB_APP_URL = os.getenv("GAS_WEB_APP_URL", "") # URL Web App GAS
-
-# Cấu hình Telegram
+# ---------------- ENV (đặt trong Render → Environment) ----------------
+REDIS_URL          = os.getenv("REDIS_URL", "")
+SQLITE_DB_PATH     = os.getenv("SQLITE_PATH", "pos_data.db")
+GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL       = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GAS_WEB_APP_URL    = os.getenv("GAS_WEB_APP_URL", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# --- KẾT NỐI REDIS (CACHE) ---
+# ---------------- REDIS (tuỳ chọn — thiếu vẫn chạy) ----------------
 r = None
-try:
-    r = redis.from_url(REDIS_URL, ssl_cert_reqs=None, decode_responses=True)
-    r.ping()
-    logging.info("✅ Kết nối Redis thành công")
-except Exception as e:
-    logging.warning(f"⚠️ Không kết nối được Redis: {e}. Hệ thống sẽ chạy không có cache.")
-    r = None
-
-# --- KẾT NỐI SQLITE (LOG, INVOICES & TUYEN CACHE) ---
-def init_sqlite():
+if REDIS_URL:
     try:
-        conn = sqlite3.connect(SQLITE_DB_PATH)
-        cursor = conn.cursor()
-        # Bảng log AI
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS ai_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                action TEXT,
-                input_summary TEXT,
-                output_result TEXT,
-                processing_time_ms INTEGER,
-                status TEXT
-            )
-        ''')
-        # Bảng hóa đơn tạm
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS invoices (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ma_hd TEXT,
-                data JSON,
-                status TEXT
-            )
-        ''')
-        # Bảng cache tuyến (Backup cho Redis)
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS tuyen_cache (
-                date TEXT PRIMARY KEY,
-                data JSON,
-                updated_at TEXT
-            )
-        ''')
-        conn.commit()
-        conn.close()
-        logging.info("✅ SQLite initialized (Logs, Invoices, Tuyen Cache)")
+        r = redis.from_url(REDIS_URL, ssl_cert_reqs=None, decode_responses=True)
+        r.ping(); log.info("✅ Redis connected")
     except Exception as e:
-        logging.error(f"Lỗi khởi tạo SQLite: {e}")
+        log.warning("⚠️ Redis OFF: %s", e); r = None
 
-init_sqlite()
-
+# ---------------- SQLITE ----------------
 @contextmanager
 def get_db():
     conn = sqlite3.connect(SQLITE_DB_PATH)
-    conn.row_factory = sqlite3.Row # Để truy cập cột theo tên
-    try:
-        yield conn
-    finally:
-        conn.close()
+    conn.row_factory = sqlite3.Row
+    try: yield conn
+    finally: conn.close()
 
-def log_ai_action(action: str, input_summary: str, output_result: str, time_ms: int, status: str):
+def init_sqlite():
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS ai_logs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, action TEXT,
+            input_summary TEXT, output_result TEXT,
+            processing_time_ms INTEGER, status TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS invoices(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ma_hd TEXT UNIQUE,
+            data JSON, status TEXT, created_at TEXT)''')
+        # ✅ PK gồm cả phien_id: tuyến của Chủ và NV không đè nhau
+        c.execute('''CREATE TABLE IF NOT EXISTS tuyen_cache(
+            date TEXT, phien_id TEXT, data JSON, updated_at TEXT,
+            PRIMARY KEY(date, phien_id))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS san_pham(
+            id TEXT PRIMARY KEY, raw JSON, updated_at TEXT)''')
+        conn.commit()
+init_sqlite()
+
+def _r_get(key):
+    if not r: return None
+    try:
+        v = r.get(key); return json.loads(v) if v else None
+    except Exception: return None
+
+def _r_set(key, val, ttl=7200):
+    if not r: return
+    try: r.setex(key, ttl, json.dumps(val, ensure_ascii=False))
+    except Exception: pass
+
+def _r_del_prefix(prefix):
+    if not r: return
+    try:
+        keys = r.keys(prefix + "*")
+        if keys: r.delete(*keys)
+    except Exception: pass
+
+def bo_dau(s):
+    s = unicodedata.normalize("NFD", str(s or "").lower())
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return s.replace("đ", "d")
+
+def log_ai_action(action, inp, out, ms, status):
     try:
         with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO ai_logs (timestamp, action, input_summary, output_result, processing_time_ms, status) VALUES (?, ?, ?, ?, ?, ?)",
-                (datetime.now().isoformat(), action, input_summary, output_result, time_ms, status)
-            )
+            conn.execute("INSERT INTO ai_logs(timestamp,action,input_summary,output_result,processing_time_ms,status) VALUES (?,?,?,?,?,?)",
+                         (datetime.now().isoformat(), action, inp, out, ms, status))
             conn.commit()
     except Exception as e:
-        logging.error(f"Lỗi ghi log SQLite: {e}")
+        log.error("Log lỗi: %s", e)
 
-# --- MODELS ---
+# ---------------- MODELS ----------------
 class InvoiceItem(BaseModel):
-    ten: str
-    ma: str
-    gia: float
-    soLuong: int
-    maKho: str
+    ten: str = ""; ma: str = ""; gia: float = 0
+    soLuong: int = 0; maKho: str = ""; giaNhap: float = 0
 
 class InvoiceRequest(BaseModel):
-    maHD: str
-    tenKhach: str
-    danhSach: List[InvoiceItem]
-    tongTien: float
-    nhanVien: str
+    maHD: str; tenKhach: str = "Khách lẻ"
+    danhSach: List[InvoiceItem] = []; tongTien: float = 0; nhanVien: str = ""
 
 class TuyenRequest(BaseModel):
-    phienId: str
-    ngay: Optional[str] = None # YYYY-MM-DD
+    phienId: str = ""; ngay: Optional[str] = None
 
-# --- TIỆN ÍCH: TELEGRAM ---
+class CacheTuyenRequest(BaseModel):
+    phienId: str = ""; ngay: Optional[str] = None; data: Any = None
+
+class InvalidateRequest(BaseModel):
+    pattern: str = "all"
+
+class ZaloRequest(BaseModel):
+    maHD: str = ""; khach: str = ""; tong: float = 0
+    nv: str = ""; timestamp: str = ""
+
+# ---------------- TELEGRAM + SYNC NỀN ----------------
 def send_telegram_message(message: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return False
     try:
-        response = requests.post(url, json=payload, timeout=5)
-        return response.status_code == 200
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"},
+            timeout=5)
+        return resp.status_code == 200
     except Exception as e:
-        logging.error(f"Lỗi Telegram: {e}")
-        return False
+        log.error("Telegram lỗi: %s", e); return False
 
-# --- BACKGROUND JOB: SYNC HÓA ĐƠN ---
 def sync_to_google_sheets_and_notify(ma_hd: str):
-    # 1. Gửi Telegram
     try:
         with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT data FROM invoices WHERE ma_hd=?", (ma_hd,))
-            row = cursor.fetchone()
-            if row:
-                data = json.loads(row[0])
-                msg = f"🔔 *BÁN HÀNG*\n🧾 `{data.get('maHD')}`\n👤 {data.get('tenKhach')}\n💰 {data.get('tongTien'):,.0f}₫\n👨💼 {data.get('nhanVien')}"
-                send_telegram_message(msg)
-    except Exception as e:
-        logging.error(f"Lỗi notify: {e}")
-
-    # 2. Sync về Google Sheets
-    if not GAS_WEB_APP_URL: return
-    try:
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT data FROM invoices WHERE ma_hd=?", (ma_hd,))
-            row = cursor.fetchone()
-            if row:
-                payload = json.loads(row[0])
-                response = requests.post(GAS_WEB_APP_URL, json={"action": "sync_invoice", "data": payload})
-                if response.status_code == 200:
-                    cursor.execute("UPDATE invoices SET status='SYNCED' WHERE ma_hd=?", (ma_hd,))
-                    conn.commit()
-                    logging.info(f"✅ Synced invoice {ma_hd}")
-                    
-                    # Xóa cache tuyến để lần sau load là thấy trạng thái mới
-                    # (Giả sử bán hàng xong thì khách đó đã được ghé)
-                    try:
-                        ngay_hien_tai = datetime.now().strftime("%Y-%m-%d")
-                        # Xóa tất cả cache tuyến của ngày hôm nay (đơn giản hóa)
-                        cursor.execute("DELETE FROM tuyen_cache WHERE date = ?", (ngay_hien_tai,))
-                        conn.commit()
-                        if r:
-                            # Xóa Redis keys liên quan (pattern search hơi phức tạp nên xóa theo key cụ thể nếu biết, hoặc flushdb nếu ít data)
-                            # Ở đây ta chỉ xóa SQLite, Redis sẽ tự hết hạn sau 5 phút
-                            pass
-                    except: pass
-    except Exception as e:
-        logging.error(f"Lỗi sync sheet: {e}")
-
-# --- ENDPOINTS ---
-
-@app.get("/")
-def read_root():
-    return {"status": "ok", "message": "POS AI Bridge Ready (Tuyen + AI + Telegram)"}
-
-# 1. TUYẾN BÁN HÀNG SIÊU NHANH (REDIS + SQLITE + GAS)
-@app.post("/api/tuyen-hom-nay")
-async def lay_tuyen_hom_nay(req: TuyenRequest):
-    ngay_hien_tai = req.ngay or datetime.now().strftime("%Y-%m-%d")
-    cache_key = f"tuyen:{ngay_hien_tai}:{req.phienId}"
-    
-    # 1. Check Redis (< 5ms)
-    if r:
-        try:
-            cached_data = r.get(cache_key)
-            if cached_data:
-                logging.info(f"⚡ Redis Hit: {cache_key}")
-                return json.loads(cached_data)
-        except Exception as e:
-            logging.error(f"Redis error: {e}")
-
-    # 2. Check SQLite (< 20ms)
-    try:
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT data FROM tuyen_cache WHERE date = ?", (ngay_hien_tai,))
-            row = cursor.fetchone()
-            if row:
-                logging.info(f"💾 SQLite Hit: {ngay_hien_tai}")
-                data = json.loads(row['data'])
-                if r: r.setex(cache_key, 300, json.dumps(data)) # Sync ngược lên Redis
-                return data
-    except Exception as e:
-        logging.error(f"SQLite error: {e}")
-
-    # 3. Call GAS (> 500ms)
-    if not GAS_WEB_APP_URL:
-        raise HTTPException(status_code=500, detail="Missing GAS_WEB_APP_URL")
-
-    try:
-        response = requests.post(GAS_WEB_APP_URL, json={
-            "action": "get_tuyen_data",
-            "phienId": req.phienId,
-            "ngay": ngay_hien_tai
-        }, timeout=10)
-        
-        if response.status_code == 200:
-            result = response.json()
-            if result.get("thanhCong"):
-                tuyen_data = result.get("data")
-                # Save to Redis (5 mins)
-                if r: r.setex(cache_key, 300, json.dumps(tuyen_data))
-                # Save to SQLite
+            row = conn.execute("SELECT data FROM invoices WHERE ma_hd=?", (ma_hd,)).fetchone()
+        if not row: return
+        data = json.loads(row["data"])
+        send_telegram_message(
+            f"🔔 *BÁN HÀNG*\n🧾 `{data.get('maHD')}`\n👤 {data.get('tenKhach')}\n"
+            f"💰 {data.get('tongTien', 0):,.0f}₫\n👨‍💼 {data.get('nhanVien')}")
+        if GAS_WEB_APP_URL:
+            resp = requests.post(GAS_WEB_APP_URL,
+                                 json={"action": "sync_invoice", "data": data}, timeout=30)
+            if resp.status_code == 200:
                 with get_db() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("INSERT OR REPLACE INTO tuyen_cache (date, data, updated_at) VALUES (?, ?, ?)", 
-                                   (ngay_hien_tai, json.dumps(tuyen_data), datetime.now().isoformat()))
+                    conn.execute("UPDATE invoices SET status='SYNCED' WHERE ma_hd=?", (ma_hd,))
+                    conn.execute("DELETE FROM tuyen_cache WHERE date=?",
+                                 (datetime.now().strftime("%Y-%m-%d"),))
                     conn.commit()
-                return tuyen_data
-            else:
-                raise HTTPException(status_code=400, detail=result.get("thongBao", "GAS Error"))
-        else:
-            raise HTTPException(status_code=500, detail="GAS Connection Error")
-    except requests.exceptions.Timeout:
-        raise HTTPException(status_code=504, detail="GAS Timeout")
+                log.info("✅ Synced %s", ma_hd)
     except Exception as e:
-        logging.error(f"GAS Fetch Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.error("Sync lỗi: %s", e)
 
-# 2. XÓA CACHE TUYẾN (Khi check-in hoặc bán hàng)
-@app.post("/api/invalidate-tuyen-cache")
-async def invalidate_tuyen_cache(req: TuyenRequest):
-    ngay_hien_tai = req.ngay or datetime.now().strftime("%Y-%m-%d")
-    cache_key = f"tuyen:{ngay_hien_tai}:{req.phienId}"
-    if r: r.delete(cache_key)
-    try:
+# ---------------- HEALTH ----------------
+@app.get("/")
+@app.get("/health")
+def health():
+    return {"status": "ok", "redis": bool(r),
+            "sqlite": os.path.exists(SQLITE_DB_PATH), "time": datetime.now().isoformat()}
+
+# ---------------- 1) SẢN PHẨM (GAS gọi) ----------------
+@app.get("/api/san-pham")
+def api_san_pham():
+    c = _r_get("pos:products:index")
+    if c and c.get("data"): return {"data": c["data"], "source": "redis"}
+    with get_db() as conn:
+        rows = conn.execute("SELECT raw FROM san_pham").fetchall()
+    if not rows: return {"data": None}          # GAS tự fallback về Sheet
+    return {"data": [json.loads(x["raw"]) for x in rows], "source": "sqlite"}
+
+@app.post("/api/cache-san-pham")
+def api_cache_san_pham(payload: List[Any]):
+    now = datetime.now().isoformat()
+    with get_db() as conn:
+        conn.execute("DELETE FROM san_pham")
+        conn.executemany("INSERT OR REPLACE INTO san_pham(id,raw,updated_at) VALUES (?,?,?)",
+                         [(str(p.get("id", i)), json.dumps(p, ensure_ascii=False), now)
+                          for i, p in enumerate(payload)])
+        conn.commit()
+    _r_set("pos:products:index",
+           {"ts": int(datetime.now().timestamp() * 1000), "data": payload}, 7200)
+    return {"status": "success", "so_sp": len(payload)}
+
+# ---------------- 2) XÓA CACHE (GAS gọi mọi lần sửa/bán) ----------------
+@app.post("/api/invalidate-cache")
+def api_invalidate(b: InvalidateRequest):
+    p = b.pattern
+    if p == "all":
+        _r_del_prefix("pos:"); _r_del_prefix("tuyen:")
         with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM tuyen_cache WHERE date = ?", (ngay_hien_tai,))
-            conn.commit()
-    except: pass
+            conn.execute("DELETE FROM tuyen_cache"); conn.execute("DELETE FROM san_pham"); conn.commit()
+    elif p == "san_pham":
+        _r_del_prefix("pos:products")
+        with get_db() as conn: conn.execute("DELETE FROM san_pham"); conn.commit()
+    elif p == "tuyen":
+        _r_del_prefix("tuyen:")
+        with get_db() as conn: conn.execute("DELETE FROM tuyen_cache"); conn.commit()
+    elif p == "khach_hang":
+        _r_del_prefix("pos:khach")
+    else:
+        _r_del_prefix(p)
     return {"status": "success"}
 
-# 3. THANH TOÁN NHANH
+# ---------------- 3) TUYẾN (✅ trả vỏ {data} · ✅ KHÔNG gọi ngược GAS) ----------------
+@app.post("/api/tuyen-hom-nay")
+def api_tuyen_hom_nay(req: TuyenRequest):
+    ngay = req.ngay or datetime.now().strftime("%Y-%m-%d")
+    key = f"tuyen:{ngay}:{req.phienId}"
+    c = _r_get(key)
+    if c: return {"data": c, "source": "redis"}
+    with get_db() as conn:
+        row = conn.execute("SELECT data FROM tuyen_cache WHERE date=? AND phien_id=?",
+                           (ngay, req.phienId)).fetchone()
+    if row:
+        d = json.loads(row["data"]); _r_set(key, d, 300)
+        return {"data": d, "source": "sqlite"}
+    return {"data": None}   # GAS tự tính từ Sheet rồi đẩy lên /api/cache-tuyen
+
+@app.post("/api/cache-tuyen")
+def api_cache_tuyen(b: CacheTuyenRequest):
+    ngay = b.ngay or datetime.now().strftime("%Y-%m-%d")
+    _r_set(f"tuyen:{ngay}:{b.phienId}", b.data, 300)
+    with get_db() as conn:
+        conn.execute("INSERT OR REPLACE INTO tuyen_cache(date,phien_id,data,updated_at) VALUES (?,?,?,?)",
+                     (ngay, b.phienId, json.dumps(b.data, ensure_ascii=False),
+                      datetime.now().isoformat()))
+        conn.commit()
+    return {"status": "success"}
+
+@app.post("/api/invalidate-tuyen-cache")
+def api_invalidate_tuyen(req: TuyenRequest):
+    ngay = req.ngay or datetime.now().strftime("%Y-%m-%d")
+    _r_del_prefix(f"tuyen:{ngay}:")
+    with get_db() as conn:
+        conn.execute("DELETE FROM tuyen_cache WHERE date=?", (ngay,)); conn.commit()
+    return {"status": "success"}
+
+# ---------------- 4) THANH TOÁN NHANH ----------------
 @app.post("/api/thanh-toan-nhanh")
-async def thanh_toan_nhanh(invoice: InvoiceRequest, background_tasks: BackgroundTasks):
-    start_time = datetime.now()
+def thanh_toan_nhanh(invoice: InvoiceRequest, background_tasks: BackgroundTasks):
+    t0 = datetime.now()
     try:
+        dump = invoice.model_dump() if hasattr(invoice, "model_dump") else invoice.dict()
         with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO invoices (ma_hd, data, status) VALUES (?, ?, ?)", 
-                           (invoice.maHD, invoice.json(), "PENDING"))
+            conn.execute("INSERT OR REPLACE INTO invoices(ma_hd,data,status,created_at) VALUES (?,?,?,?)",
+                         (invoice.maHD, json.dumps(dump, ensure_ascii=False),
+                          "PENDING", t0.isoformat()))
             conn.commit()
-
-        if r:
-            pipe = r.pipeline()
-            for item in invoice.danhSach:
-                pipe.decrby(f"tonkho:{item.ma}", item.soLuong)
-            pipe.execute()
-
+        # Tồn kho sắp đổi ở Sheet → bỏ cache SP để lần sau nạp mới
+        _r_del_prefix("pos:products")
+        with get_db() as conn:
+            conn.execute("DELETE FROM san_pham"); conn.commit()
         background_tasks.add_task(sync_to_google_sheets_and_notify, invoice.maHD)
-        
-        duration = int((datetime.now() - start_time).total_seconds() * 1000)
-        log_ai_action("PAYMENT", f"HD: {invoice.maHD}", f"Tong: {invoice.tongTien}", duration, "SUCCESS")
+        ms = int((datetime.now() - t0).total_seconds() * 1000)
+        log_ai_action("PAYMENT", f"HD {invoice.maHD}", f"Tong {invoice.tongTien}", ms, "SUCCESS")
         return {"status": "success", "maHD": invoice.maHD}
     except Exception as e:
-        log_ai_action("PAYMENT", f"HD: {invoice.maHD}", str(e), 0, "FAILED")
-        raise HTTPException(status_code=500, detail=str(e))
+        log_ai_action("PAYMENT", f"HD {invoice.maHD}", str(e), 0, "FAILED")
+        raise HTTPException(500, str(e))
 
-# 4. NÉN ẢNH
+# ---------------- 5) NÉN ẢNH ----------------
 @app.post("/api/nen-anh")
-async def compress_image_endpoint(file: UploadFile = File(...)):
+async def nen_anh(file: UploadFile = File(...)):
     try:
-        contents = await file.read()
-        img = Image.open(io.BytesIO(contents))
-        img.thumbnail((800, 800))
-        if img.mode in ("RGBA", "P"): img = img.convert("RGB")
-        buffered = io.BytesIO()
-        img.save(buffered, format="JPEG", quality=75)
-        return {"b64": base64.b64encode(buffered.getvalue()).decode()}
+        img = Image.open(io.BytesIO(await file.read()))
+        if img.mode in ("RGBA", "P", "LA"): img = img.convert("RGB")
+        img.thumbnail((1024, 1024))
+        q, buf = 75, io.BytesIO()
+        img.save(buf, format="JPEG", quality=q, optimize=True)
+        while buf.tell() > 900_000 and q > 30:
+            q -= 10; buf = io.BytesIO(); img.save(buf, format="JPEG", quality=q, optimize=True)
+        return {"b64": base64.b64encode(buf.getvalue()).decode()}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
 
-# 5. TÌM KIẾM ẢNH (AI)
+# ---------------- 6) TÌM BẰNG HÌNH ẢNH (trả VỀ SP THẬT để chạm thêm giỏ được) ----------------
+def _lay_ds_sp():
+    c = _r_get("pos:products:index")
+    if c and c.get("data"): return c["data"]
+    with get_db() as conn:
+        rows = conn.execute("SELECT raw FROM san_pham").fetchall()
+    return [json.loads(x["raw"]) for x in rows]
+
 @app.post("/api/tim-bang-anh")
-async def search_by_image_endpoint(file: UploadFile = File(...)):
-    try:
-        contents = await file.read()
-        img_hash = hashlib.md5(contents).hexdigest()
-        cache_key = f"img_search_{img_hash}"
-        
-        if r:
-            cached = r.get(cache_key)
-            if cached: return json.loads(cached)
-
-        result_data = {"tenAI": "Unknown", "danhSach": []}
-        if GEMINI_API_KEY:
-            img_b64 = base64.b64encode(contents).decode()
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-            payload = {
-                "contents": [{"parts": [{"text": "Nhận diện sản phẩm. JSON: {'ten': '...', 'tuKhoa': []}"}, {"inline_data": {"mime_type": file.content_type, "data": img_b64}}]}],
-                "generationConfig": {"response_mime_type": "application/json"}
-            }
-            resp = requests.post(url, json=payload)
+async def tim_bang_anh(file: UploadFile = File(...)):
+    contents = await file.read()
+    key = f"img_search_{hashlib.md5(contents).hexdigest()}"
+    c = _r_get(key)
+    if c: return c
+    result = {"tenAI": "", "danhSach": []}
+    if GEMINI_API_KEY:
+        try:
+            resp = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}",
+                json={"contents": [{"parts": [
+                    {"text": 'Nhận diện sản phẩm tạp hoá trong ảnh. Trả về CHỈ JSON: {"ten": "..."}'},
+                    {"inline_data": {"mime_type": file.content_type or "image/jpeg",
+                                     "data": base64.b64encode(contents).decode()}}]}],
+                    "generationConfig": {"response_mime_type": "application/json"}},
+                timeout=20)
             if resp.status_code == 200:
-                text = resp.json()['candidates'][0]['content']['parts'][0]['text'].replace("```json", "").replace("```", "").strip()
-                ai_res = json.loads(text)
-                result_data = {"tenAI": ai_res.get("ten"), "danhSach": [{"ten": ai_res.get("ten"), "ma": "", "gia": 0}]}
-        
-        if r: r.setex(cache_key, 3600, json.dumps(result_data))
-        return result_data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+                text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+                ai = json.loads(text.replace("```json", "").replace("```", "").strip())
+                ten_ai = str(ai.get("ten", "")).strip()
+                result["tenAI"] = ten_ai
+                kd = bo_dau(ten_ai).replace(" ", "")
+                if kd:
+                    result["danhSach"] = [
+                        p for p in _lay_ds_sp()
+                        if kd in bo_dau(p.get("ten", "")).replace(" ", "")
+                        or bo_dau(p.get("ten", "")).replace(" ", "") in kd][:12]
+        except Exception as e:
+            log.error("Gemini lỗi: %s", e)
+    _r_set(key, result, 3600)
+    return result
 
-# 6. TEST TELEGRAM
+# ---------------- 7) DỰ BÁO TỒN KHO ----------------
+@app.get("/api/bao-cao-du-bao/{so_ngay}")
+def bao_cao_du_bao(so_ngay: int = 7):
+    cut = datetime.now() - timedelta(days=30)
+    ban = {}
+    with get_db() as conn:
+        rows = conn.execute("SELECT data, created_at FROM invoices").fetchall()
+    for x in rows:
+        try:
+            if datetime.fromisoformat(x["created_at"]) < cut: continue
+            for it in json.loads(x["data"]).get("danhSach", []):
+                k = bo_dau(it.get("ten", "")).strip()
+                ban[k] = ban.get(k, 0) + (it.get("soLuong") or 0)
+        except Exception: continue
+    if not ban: return []
+    out = []
+    for p in _lay_ds_sp():
+        tb = ban.get(bo_dau(p.get("ten", "")).strip(), 0) / 30.0
+        if tb <= 0: continue
+        ngay_con = (float(p.get("tonKho") or 0)) / tb
+        if ngay_con <= so_ngay:
+            out.append({"ten": p.get("ten"), "ngay_con": round(ngay_con, 1),
+                        "muc_do": "nguy_hiem" if ngay_con <= 3 else "canh_bao"})
+    out.sort(key=lambda x: x["ngay_con"])
+    return out
+
+# ---------------- 8) THÔNG BÁO BÁN HÀNG (alias sửa lỗi nối đuôi /api) ----------------
+@app.post("/api/thong-bao-zalo")
+@app.post("/api/api/thong-bao-zalo")
+def thong_bao_zalo(b: ZaloRequest):
+    ok = send_telegram_message(
+        f"🧾 *{b.maHD}*\n👤 {b.khach}\n💰 {b.tong:,.0f}₫\n👨‍💼 {b.nv}\n🕒 {b.timestamp}")
+    log_ai_action("NOTIFY", b.maHD, f"telegram={ok}", 0, "SUCCESS" if ok else "SKIP")
+    return {"status": "ok", "telegram": ok}
+
+# ---------------- 9) TIỆN ÍCH ----------------
 @app.get("/api/test-telegram")
 def test_telegram():
-    if send_telegram_message("🤖 Test thành công! POS GNP AI Bridge đang hoạt động."):
-        return {"status": "success"}
-    return {"status": "error"}
+    return {"status": "success" if send_telegram_message("🤖 Test OK — POS GNP AI Bridge") else "error"}
 
-# 7. LOGS
 @app.get("/api/logs")
 def get_logs(limit: int = 10):
-    try:
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM ai_logs ORDER BY id DESC LIMIT ?", (limit,))
-            rows = cursor.fetchall()
-            return {"logs": [dict(row) for row in rows]}
-    except Exception as e:
-        return {"error": str(e)}
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM ai_logs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return {"logs": [dict(x) for x in rows]}
